@@ -1,22 +1,14 @@
+import argparse
 import editdistance
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 
-from ..hf import detect_device
+from ..torch.config import MoondreamConfig
+from ..torch.moondream import MoondreamModel
+from ..torch.weights import load_weights_into_model
 
-MODEL_ID = "vikhyatk/moondream2"
-DEVICE, DTYPE = detect_device()
-
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-moondream = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    trust_remote_code=True,
-    attn_implementation="flash_attention_2",
-    torch_dtype=DTYPE,
-    device_map={"": DEVICE},
-)
-moondream.eval()
+SUFFIX = " The answer should be a short text span taken verbatim from the document."
 
 
 def get_anls(s1, s2):
@@ -27,19 +19,65 @@ def get_anls(s1, s2):
     return anls
 
 
-docvqa_val = load_dataset("vikhyatk/docvqa", split="validation")
+def eval_docvqa(model, debug=False):
+    docvqa_val = load_dataset("vikhyatk/docvqa-val", split="validation")
 
-scores = []
-for row in tqdm(docvqa_val):
-    image = row["image"]
-    enc_image = moondream.encode_image(image)
-    for qa in row["qa"]:
-        question = qa["question"]
-        answers = qa["answers"]
-        prompt = f"{question}\nAnswer briefly with a single word or phrase."
+    scores = []
+    results = []
 
-        model_answer = moondream.answer_question(enc_image, prompt, tokenizer)
-        anls = max(get_anls(model_answer, gt) for gt in answers)
-        scores.append(anls)
+    for row in tqdm(docvqa_val, disable=debug, desc="DocVQA"):
+        image = row["image"]
+        encoded_image = model.encode_image(image)
 
-print("ANLS:", sum(scores) / len(scores))
+        result = []
+        for qa in row["qa"]:
+            question = qa["question"]
+            answers = qa["answers"]
+            prompt = question + SUFFIX
+
+            model_answer = model.query(encoded_image, prompt)["answer"]
+            anls = max(get_anls(model_answer, gt) for gt in answers)
+            scores.append(anls)
+            result.append(
+                {
+                    "question": question,
+                    "ground_truth": answers,
+                    "model_answer": model_answer,
+                    "anls": anls,
+                }
+            )
+
+            if debug:
+                print(f"Question: {question}")
+                print(f"Ground Truth: {answers}")
+                print(f"Model Answer: {model_answer}")
+                print(f"ANLS: {anls}")
+                print(f"Current Average ANLS: {sum(scores) / len(scores):.4f}")
+                print("---------")
+        results.append(result)
+
+    return {
+        "anls": sum(scores) / len(scores),
+        "results": results,
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args()
+
+    if torch.cuda.is_available():
+        torch.set_default_device("cuda")
+    elif torch.backends.mps.is_available():
+        torch.set_default_device("mps")
+
+    config = MoondreamConfig()
+    model = MoondreamModel(config)
+    load_weights_into_model(args.model, model)
+    model.compile()
+
+    result = eval_docvqa(model, args.debug)
+
+    print(f"ANLS: {result['anls']:.4f}")

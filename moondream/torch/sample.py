@@ -1,24 +1,23 @@
 import argparse
 import json
 import os
-
 import torch
-from PIL import Image
-from transformers import AutoTokenizer
 
-from .rope import precompute_freqs_cis
-from .text import lm_head, text_decoder, text_encoder
-from .vision import encode_image
-from .weights import load_from_pt, load_from_safetensors
+from PIL import Image, ImageDraw
+from tqdm import tqdm
+
+from .weights import load_weights_into_model
+from .moondream import MoondreamModel, MoondreamConfig
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", "-i", type=str, required=True)
     parser.add_argument("--prompt", "-p", type=str, required=True)
     parser.add_argument("--model", "-m", type=str, required=True)
-    parser.add_argument("--config", "-c", type=str, default="{}")
+    parser.add_argument("--config", "-c", type=str, default=None)
     parser.add_argument("--max-tokens", "-t", type=int, default=200)
     parser.add_argument("--sampler", "-s", type=str, default="greedy")
+    parser.add_argument("--benchmark", "-b", action="store_true")
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -26,74 +25,120 @@ if __name__ == "__main__":
     elif torch.backends.mps.is_available():
         torch.set_default_device("mps")
 
-    # Load config.
-    config = json.loads(args.config)
-    text_n_heads = config.get("text_n_heads", 32)
-
     # Load model.
-    model_path = args.model
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model not found at {model_path}")
-    if model_path.endswith(".pt"):
-        model = load_from_pt(model_path, **config)
-    elif model_path.endswith(".safetensors"):
-        model = load_from_safetensors(model_path, **config)
+    if args.config is not None:
+        with open(args.config, "r") as f:
+            config = json.load(f)
+        config = MoondreamConfig.from_dict(config)
     else:
-        raise ValueError(f"Invalid model format: {model_path}")
+        config = MoondreamConfig()
+    model = MoondreamModel(config)
+    load_weights_into_model(args.model, model)
 
     # Encode image.
     image_path = args.image
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found at {image_path}")
     image = Image.open(image_path)
-    image = image.resize((378, 378))
-    image_tensor = encode_image(image, model.vision)
 
-    # Encode text, and create inputs_embeds.
-    tokenizer = AutoTokenizer.from_pretrained("vikhyatk/moondream2")
-    prompt = f"\n\nQuestion: {args.prompt}\n\nAnswer:"
-    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
-    input_ids = torch.cat([torch.tensor([[tokenizer.eos_token_id]]), input_ids], dim=1)
-    inputs_embeds = text_encoder(input_ids, model.text)
-    inputs_embeds = torch.cat(
-        [
-            inputs_embeds[:, 0:1, :],
-            image_tensor.unsqueeze(0),
-            inputs_embeds[:, 1:, :],
-        ],
-        dim=1,
-    )
+    if not args.benchmark:
+        encoded_image = model.encode_image(image)
 
-    kv_cache = torch.empty(24, 2, 1, text_n_heads, 2048, 64, dtype=torch.float16)
-    freqs_cis = precompute_freqs_cis(32, 2048)
-    pos = 0
+        # Short caption
+        print("Caption: short")
+        for t in model.caption(encoded_image, "short", stream=True)["caption"]:
+            print(t, end="", flush=True)
+        print()
+        print()
 
-    for _ in range(args.max_tokens):
-        with torch.no_grad():
-            hidden, kv_cache_update = text_decoder(
-                inputs_embeds, model.text, kv_cache[:, :, :, :, :pos, :], freqs_cis
+        # Regular caption
+        print("Caption: normal")
+        for t in model.caption(encoded_image, "normal", stream=True)["caption"]:
+            print(t, end="", flush=True)
+        print()
+        print()
+
+        # Query
+        print("Query:", args.prompt)
+        for t in model.query(encoded_image, args.prompt, stream=True)["answer"]:
+            print(t, end="", flush=True)
+        print()
+        print()
+
+        # Detect
+        obj = "hand"
+        print(f"Detect: {obj}")
+        objs = model.detect(encoded_image, obj)["objects"]
+        print(f"Found {len(objs)}")
+        print()
+        draw = ImageDraw.Draw(image)
+        for obj in objs:
+            x_min, y_min, x_max, y_max = (
+                obj["x_min"] * image.width,
+                obj["y_min"] * image.height,
+                obj["x_max"] * image.width,
+                obj["y_max"] * image.height,
             )
-            logits = lm_head(hidden, model.text)
-            kv_cache[:, :, :, :, pos : pos + kv_cache_update.size(-2), :] = (
-                kv_cache_update
-            )
-            pos += kv_cache_update.size(-2)
+            draw.rectangle([x_min, y_min, x_max, y_max], outline="red", width=2)
+        image.save("detect.jpg")
 
-            if args.sampler == "multinomial":
-                next_token = torch.multinomial(
-                    torch.softmax(logits, dim=-1), num_samples=1
-                ).squeeze(0)
-            elif args.sampler == "greedy":
-                next_token = torch.argmax(logits, dim=-1)
-            else:
-                raise ValueError(f"Invalid sampler: {args.sampler}")
+        # Point
+        obj = "ear"
+        print(f"Point: {obj}")
+        points = model.point(encoded_image, obj)["points"]
+        print(f"Found {len(points)}")
+        draw = ImageDraw.Draw(image)
+        for point in points:
+            x, y = point["x"] * image.width, point["y"] * image.height
+            draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill="red")
+        image.save("point.jpg")
 
-            if next_token == tokenizer.eos_token_id:
-                print()
-                break
+        # Detect gaze
+        model.detect_gaze(encoded_image, (0.5, 0.5))
+    else:
+        torch._dynamo.reset()
+        model.compile()
 
-            input_ids = next_token.unsqueeze(0)
-            inputs_embeds = text_encoder(input_ids, model.text)
+        # Warmup runs
+        for _ in tqdm(range(5), desc="Warmup"):
+            encoded_image = model.encode_image(image)
+            for _ in model.query(encoded_image, args.prompt, stream=True)["answer"]:
+                pass
 
-            output_text = tokenizer.batch_decode(input_ids)[0]
-            print(output_text, end="", flush=True)
+        # Benchmark runs
+        encode_times = []
+        query_speeds = []
+        for i in tqdm(range(10), desc="Benchmark"):
+            # Measure encode time
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            encoded_image = model.encode_image(image)
+            end.record()
+            torch.cuda.synchronize()
+            encode_time = start.elapsed_time(end)
+            encode_times.append(encode_time)
+
+            # Measure query speed
+            tokens = []
+            query_start = torch.cuda.Event(enable_timing=True)
+            query_end = torch.cuda.Event(enable_timing=True)
+            query_start.record()
+            for t in model.query(encoded_image, args.prompt, stream=True)["answer"]:
+                tokens.append(t)
+            query_end.record()
+            torch.cuda.synchronize()
+            query_time = query_start.elapsed_time(query_end)
+            tokens_per_sec = len(tokens) / (query_time / 1000.0)  # Convert ms to s
+            query_speeds.append(tokens_per_sec)
+
+        # Print results
+        print("\nBenchmark Results (10 runs):")
+        print("Image Encoding Time (ms):")
+        print(f"  Mean: {sum(encode_times)/len(encode_times):.2f}")
+        print(f"  Min:  {min(encode_times):.2f}")
+        print(f"  Max:  {max(encode_times):.2f}")
+        print("\nQuery Speed (tokens/sec):")
+        print(f"  Mean: {sum(query_speeds)/len(query_speeds):.2f}")
+        print(f"  Min:  {min(query_speeds):.2f}")
+        print(f"  Max:  {max(query_speeds):.2f}")

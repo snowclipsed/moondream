@@ -1,62 +1,9 @@
-import math
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Callable, List
-
 import safetensors
 import torch
+import torch.nn as nn
 
-from .layers import AttentionWeights, LayerNormWeights, LinearWeights, MLPWeights
-
-
-@dataclass
-class VisionBlock:
-    ln1: LayerNormWeights
-    attn: AttentionWeights
-    ln2: LayerNormWeights
-    mlp: MLPWeights
-
-
-@dataclass
-class VisionModel:
-    patch_size: int
-    patch_emb: LinearWeights
-    pos_emb: torch.Tensor
-    blocks: List[VisionBlock]
-    post_ln: LayerNormWeights
-    proj_mlp: MLPWeights
-
-
-@dataclass
-class TextBlock:
-    ln: LayerNormWeights
-    attn: AttentionWeights
-    mlp: MLPWeights
-
-
-@dataclass
-class TextModel:
-    wte: torch.Tensor
-    blocks: List[TextBlock]
-    post_ln: LayerNormWeights
-    lm_head: LinearWeights
-
-
-@dataclass
-class RegionModel:
-    coord_features: torch.Tensor
-    coord_encoder: LinearWeights
-    coord_decoder: MLPWeights
-    size_features: torch.Tensor
-    size_encoder: LinearWeights
-    size_decoder: MLPWeights
-
-
-@dataclass
-class MoondreamModel:
-    vision: VisionModel
-    text: TextModel
-    region: RegionModel
+from contextlib import contextmanager
+from typing import Callable, List
 
 
 @contextmanager
@@ -72,188 +19,151 @@ def safetensors_open(safetensors_file: str):
         def get_tensor(name: str) -> torch.Tensor:
             return st.get_tensor(name)
 
+        def get_keys() -> List[str]:
+            return st.keys()
+
+        get_tensor.keys = get_keys
+
         yield get_tensor
 
 
-def load_model(
-    get_tensor: Callable[[str], torch.Tensor],
-    vision_blocks: int = 27,
-    text_blocks: int = 24,
-    vision_n_heads: int = 16,
-    text_n_heads: int = 32,
-) -> MoondreamModel:
-    ## Vision encoder
-    prefix = "vision_encoder.encoder.model.visual.patch_embed.linear"
-    patch_emb = LinearWeights(
-        weight=get_tensor(f"{prefix}.weight"), bias=get_tensor(f"{prefix}.bias")
-    )
-    patch_size = int(math.sqrt(patch_emb.weight.shape[1] // 3))
-    pos_emb = get_tensor("vision_encoder.encoder.model.visual.pos_embed")
-    post_ln = LayerNormWeights(
-        weight=get_tensor("vision_encoder.encoder.model.visual.norm.weight"),
-        bias=get_tensor("vision_encoder.encoder.model.visual.norm.bias"),
-    )
-    blocks = []
-    for i in range(vision_blocks):
-        prefix = f"vision_encoder.encoder.model.visual.blocks.{i}"
-        blocks.append(
-            VisionBlock(
-                ln1=LayerNormWeights(
-                    weight=get_tensor(f"{prefix}.norm1.weight"),
-                    bias=get_tensor(f"{prefix}.norm1.bias"),
-                ),
-                attn=AttentionWeights(
-                    qkv=LinearWeights(
-                        weight=get_tensor(f"{prefix}.attn.qkv.weight"),
-                        bias=get_tensor(f"{prefix}.attn.qkv.bias"),
-                    ),
-                    proj=LinearWeights(
-                        weight=get_tensor(f"{prefix}.attn.proj.weight"),
-                        bias=get_tensor(f"{prefix}.attn.proj.bias"),
-                    ),
-                    n_heads=vision_n_heads,
-                ),
-                ln2=LayerNormWeights(
-                    weight=get_tensor(f"{prefix}.norm2.weight"),
-                    bias=get_tensor(f"{prefix}.norm2.bias"),
-                ),
-                mlp=MLPWeights(
-                    fc1=LinearWeights(
-                        weight=get_tensor(f"{prefix}.mlp.fc1.weight"),
-                        bias=get_tensor(f"{prefix}.mlp.fc1.bias"),
-                    ),
-                    fc2=LinearWeights(
-                        weight=get_tensor(f"{prefix}.mlp.fc2.weight"),
-                        bias=get_tensor(f"{prefix}.mlp.fc2.bias"),
-                    ),
-                ),
-            )
-        )
-    proj_mlp = MLPWeights(
-        fc1=LinearWeights(
-            weight=get_tensor("vision_encoder.projection.mlp.fc1.weight"),
-            bias=get_tensor("vision_encoder.projection.mlp.fc1.bias"),
-        ),
-        fc2=LinearWeights(
-            weight=get_tensor("vision_encoder.projection.mlp.fc2.weight"),
-            bias=get_tensor("vision_encoder.projection.mlp.fc2.bias"),
-        ),
-        act="gelu_approx",
-    )
-    vision = VisionModel(
-        patch_size=patch_size,
-        patch_emb=patch_emb,
-        pos_emb=pos_emb,
-        blocks=blocks,
-        post_ln=post_ln,
-        proj_mlp=proj_mlp,
-    )
+def _load_weights(get_tensor: Callable[[str], torch.Tensor], model: nn.Module) -> None:
+    """Internal function to load weights using a tensor getter function."""
+    model = model.to(dtype=torch.float16)
 
-    ## Text decoder model
-    wte = get_tensor("text_model.transformer.embd.wte.weight")
-    post_ln = LayerNormWeights(
-        weight=get_tensor("text_model.lm_head.ln.weight"),
-        bias=get_tensor("text_model.lm_head.ln.bias"),
-    )
-    lm_head = LinearWeights(
-        weight=get_tensor("text_model.lm_head.linear.weight"),
-        bias=get_tensor("text_model.lm_head.linear.bias"),
-    )
-    blocks = []
-    for i in range(text_blocks):
-        prefix = f"text_model.transformer.h.{i}"
-        blocks.append(
-            TextBlock(
-                ln=LayerNormWeights(
-                    weight=get_tensor(f"{prefix}.ln.weight"),
-                    bias=get_tensor(f"{prefix}.ln.bias"),
-                ),
-                attn=AttentionWeights(
-                    qkv=LinearWeights(
-                        weight=get_tensor(f"{prefix}.mixer.Wqkv.weight"),
-                        bias=get_tensor(f"{prefix}.mixer.Wqkv.bias"),
-                    ),
-                    proj=LinearWeights(
-                        weight=get_tensor(f"{prefix}.mixer.out_proj.weight"),
-                        bias=get_tensor(f"{prefix}.mixer.out_proj.bias"),
-                    ),
-                    n_heads=text_n_heads,
-                ),
-                mlp=MLPWeights(
-                    fc1=LinearWeights(
-                        weight=get_tensor(f"{prefix}.mlp.fc1.weight"),
-                        bias=get_tensor(f"{prefix}.mlp.fc1.bias"),
-                    ),
-                    fc2=LinearWeights(
-                        weight=get_tensor(f"{prefix}.mlp.fc2.weight"),
-                        bias=get_tensor(f"{prefix}.mlp.fc2.bias"),
-                    ),
-                    act="gelu_approx",
-                ),
-            )
-        )
-    text = TextModel(wte=wte, blocks=blocks, post_ln=post_ln, lm_head=lm_head)
-
-    ## Region model
-    region = RegionModel(
-        coord_features=get_tensor("region_model.coordinate_features.weight").T,
-        coord_encoder=LinearWeights(
-            weight=get_tensor("region_model.coordinate_encoder.weight"),
-            bias=get_tensor("region_model.coordinate_encoder.bias"),
-        ),
-        coord_decoder=MLPWeights(
-            fc1=LinearWeights(
-                weight=get_tensor("region_model.coordinate_decoder.fc1.weight"),
-                bias=get_tensor("region_model.coordinate_decoder.fc1.bias"),
-            ),
-            fc2=LinearWeights(
-                weight=get_tensor("region_model.coordinate_decoder.fc2.weight"),
-                bias=get_tensor("region_model.coordinate_decoder.fc2.bias"),
-            ),
-        ),
-        size_features=get_tensor("region_model.size_features.weight").T,
-        size_encoder=LinearWeights(
-            weight=get_tensor("region_model.size_encoder.weight"),
-            bias=get_tensor("region_model.size_encoder.bias"),
-        ),
-        size_decoder=MLPWeights(
-            fc1=LinearWeights(
-                weight=get_tensor("region_model.size_decoder.fc1.weight"),
-                bias=get_tensor("region_model.size_decoder.fc1.bias"),
-            ),
-            fc2=LinearWeights(
-                weight=get_tensor("region_model.size_decoder.fc2.weight"),
-                bias=get_tensor("region_model.size_decoder.fc2.bias"),
-            ),
-        ),
-    )
-
-    return MoondreamModel(vision=vision, text=text, region=region)
-
-
-def load_from_safetensors(
-    safetensors_file: str,
-    **kwargs,
-) -> MoondreamModel:
-    with safetensors_open(safetensors_file) as get_tensor:
-        return load_model(get_tensor, **kwargs)
-
-
-def load_from_pt(
-    pt_file: str,
-    vision_blocks: int = 27,
-    text_blocks: int = 24,
-    **kwargs,
-) -> MoondreamModel:
-    device = str(torch.empty(0).device)
-    tensors = torch.load(pt_file, map_location=device, weights_only=True)
-    tensors = {
-        k.replace("._orig_mod", ""): v.to(dtype=torch.float16)
-        for k, v in tensors.items()
+    vision = model.vision
+    region = model.region
+    weight_map = {
+        "vision_encoder.encoder.model.visual.patch_embed.linear.weight": vision[
+            "patch_emb"
+        ].weight,
+        "vision_encoder.encoder.model.visual.patch_embed.linear.bias": vision[
+            "patch_emb"
+        ].bias,
+        "vision_encoder.encoder.model.visual.pos_embed": vision.pos_emb,
+        "vision_encoder.encoder.model.visual.norm.weight": vision["post_ln"].weight,
+        "vision_encoder.encoder.model.visual.norm.bias": vision["post_ln"].bias,
+        "vision_encoder.projection.mlp.fc1.weight": vision["proj_mlp"]["fc1"].weight,
+        "vision_encoder.projection.mlp.fc1.bias": vision["proj_mlp"]["fc1"].bias,
+        "vision_encoder.projection.mlp.fc2.weight": vision["proj_mlp"]["fc2"].weight,
+        "vision_encoder.projection.mlp.fc2.bias": vision["proj_mlp"]["fc2"].bias,
+        "text_model.transformer.embd.wte.weight": model.text.wte,
+        "text_model.lm_head.ln.weight": model.text["post_ln"].weight,
+        "text_model.lm_head.ln.bias": model.text["post_ln"].bias,
+        "text_model.lm_head.linear.weight": model.text["lm_head"].weight,
+        "text_model.lm_head.linear.bias": model.text["lm_head"].bias,
+        "region_model.coordinate_encoder.weight": region["coord_encoder"].weight,
+        "region_model.coordinate_encoder.bias": region["coord_encoder"].bias,
+        "region_model.coordinate_decoder.fc1.weight": region["coord_decoder"][
+            "fc1"
+        ].weight,
+        "region_model.coordinate_decoder.fc1.bias": region["coord_decoder"]["fc1"].bias,
+        "region_model.coordinate_decoder.fc2.weight": region["coord_decoder"][
+            "fc2"
+        ].weight,
+        "region_model.coordinate_decoder.fc2.bias": region["coord_decoder"]["fc2"].bias,
+        "region_model.size_encoder.weight": region["size_encoder"].weight,
+        "region_model.size_encoder.bias": region["size_encoder"].bias,
+        "region_model.size_decoder.fc1.weight": region["size_decoder"]["fc1"].weight,
+        "region_model.size_decoder.fc1.bias": region["size_decoder"]["fc1"].bias,
+        "region_model.size_decoder.fc2.weight": region["size_decoder"]["fc2"].weight,
+        "region_model.size_decoder.fc2.bias": region["size_decoder"]["fc2"].bias,
     }
-    return load_model(lambda x: tensors[x], vision_blocks, text_blocks, **kwargs)
+
+    for i in range(len(model.vision["blocks"])):
+        prefix = f"vision_encoder.encoder.model.visual.blocks.{i}"
+        blk = model.vision["blocks"][i]
+        weight_map.update(
+            {
+                f"{prefix}.norm1.weight": blk["ln1"].weight,
+                f"{prefix}.norm1.bias": blk["ln1"].bias,
+                f"{prefix}.norm2.weight": blk["ln2"].weight,
+                f"{prefix}.norm2.bias": blk["ln2"].bias,
+                f"{prefix}.attn.qkv.weight": blk["attn"]["qkv"].weight,
+                f"{prefix}.attn.qkv.bias": blk["attn"]["qkv"].bias,
+                f"{prefix}.attn.proj.weight": blk["attn"]["proj"].weight,
+                f"{prefix}.attn.proj.bias": blk["attn"]["proj"].bias,
+                f"{prefix}.mlp.fc1.weight": blk["mlp"]["fc1"].weight,
+                f"{prefix}.mlp.fc1.bias": blk["mlp"]["fc1"].bias,
+                f"{prefix}.mlp.fc2.weight": blk["mlp"]["fc2"].weight,
+                f"{prefix}.mlp.fc2.bias": blk["mlp"]["fc2"].bias,
+            }
+        )
+
+    for i in range(len(model.text["blocks"])):
+        prefix = f"text_model.transformer.h.{i}"
+        blk = model.text["blocks"][i]
+        weight_map.update(
+            {
+                f"{prefix}.ln.weight": blk["ln"].weight,
+                f"{prefix}.ln.bias": blk["ln"].bias,
+                f"{prefix}.mixer.Wqkv.weight": blk["attn"]["qkv"].weight,
+                f"{prefix}.mixer.Wqkv.bias": blk["attn"]["qkv"].bias,
+                f"{prefix}.mixer.out_proj.weight": blk["attn"]["proj"].weight,
+                f"{prefix}.mixer.out_proj.bias": blk["attn"]["proj"].bias,
+                f"{prefix}.mlp.fc1.weight": blk["mlp"]["fc1"].weight,
+                f"{prefix}.mlp.fc1.bias": blk["mlp"]["fc1"].bias,
+                f"{prefix}.mlp.fc2.weight": blk["mlp"]["fc2"].weight,
+                f"{prefix}.mlp.fc2.bias": blk["mlp"]["fc2"].bias,
+            }
+        )
+
+    for key, tensor in weight_map.items():
+        tensor.data.copy_(get_tensor(key))
+
+    region.coord_features.data.copy_(
+        get_tensor("region_model.coordinate_features.weight").T
+    )
+    region.size_features.data.copy_(get_tensor("region_model.size_features.weight").T)
 
 
-if __name__ == "__main__":
-    weights = load_from_safetensors("model.safetensors")
-    print(weights)
+def load_weights_from_safetensors(weights_file: str, model: nn.Module) -> None:
+    """Load weights from a safetensors file into a MoondreamModel instance."""
+    with safetensors_open(weights_file) as get_tensor:
+        if (
+            "vision.blocks.0.attn.proj.bias" in get_tensor.keys()
+            or "model.vision.blocks.0.attn.proj.bias" in get_tensor.keys()
+        ):
+            with safetensors_open(weights_file) as get_tensor:
+                tensors = {
+                    k.replace("model.", ""): get_tensor(k) for k in get_tensor.keys()
+                }
+                model.load_state_dict(tensors, strict=False)
+        else:
+            # Wrap the get_tensor function to handle key normalization
+            name_map = {k.replace("._orig_mod", ""): k for k in get_tensor.keys()}
+            _load_weights(
+                lambda x: get_tensor(name_map[x]).to(dtype=torch.float16), model
+            )
+
+
+def load_weights_from_pt(weights_file: str, model: nn.Module) -> None:
+    """Load weights from a PyTorch file into a MoondreamModel instance."""
+    device = str(torch.empty(0).device)
+    tensors = torch.load(weights_file, map_location=device, weights_only=True)
+    if "vision.blocks.0.attn.proj.bias" in tensors.keys():
+        model.load_state_dict(tensors, strict=False)
+    else:
+        tensors = {
+            k.replace("._orig_mod", ""): v.to(dtype=torch.float16)
+            for k, v in tensors.items()
+        }
+        _load_weights(lambda x: tensors[x], model)
+
+
+def load_weights_into_model(weights_file: str, model: nn.Module) -> None:
+    """
+    Load weights from either a safetensors or PyTorch file directly into a MoondreamModel instance.
+
+    Args:
+        weights_file: Path to weights file (either .safetensors or .pt)
+        model: MoondreamModel instance to load weights into
+    """
+    if weights_file.endswith(".safetensors"):
+        load_weights_from_safetensors(weights_file, model)
+    else:
+        load_weights_from_pt(weights_file, model)
+
+    # Make all parameters contiguous
+    for param in model.parameters():
+        param.data = param.data.contiguous()
