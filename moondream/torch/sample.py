@@ -8,8 +8,10 @@ from tqdm import tqdm
 
 from .weights import load_weights_into_model
 from .moondream import MoondreamModel, MoondreamConfig
+import time
 
 if __name__ == "__main__":
+    start = time.time()
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", "-i", type=str, required=True)
     parser.add_argument("--prompt", "-p", type=str, required=True)
@@ -32,17 +34,20 @@ if __name__ == "__main__":
         config = MoondreamConfig.from_dict(config)
     else:
         config = MoondreamConfig()
+
     model = MoondreamModel(config)
     load_weights_into_model(args.model, model)
-    model = model.to(device)
 
     # Encode image.
     image_path = args.image
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found at {image_path}")
     image = Image.open(image_path)
+    model = model.to(device)
 
     if not args.benchmark:
+
+        # model.compile()
         encoded_image = model.encode_image(image)
 
         # Short caption
